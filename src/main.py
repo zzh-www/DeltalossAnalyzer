@@ -1,6 +1,8 @@
 import argparse
 import json
 import os
+import subprocess
+import sys
 from delta_loss import DeltaLossAnalyzer
 
 
@@ -53,6 +55,12 @@ def main():
         json.dump(sensitivity, f, indent=2)
     print(f"Sensitivity saved to {sens_path}")
 
+    # Save model info (parameter counts)
+    info_path = os.path.join(model_output_dir, "model_info.json")
+    with open(info_path, "w") as f:
+        json.dump(analyzer.layer_params, f, indent=2)
+    print(f"Model info saved to {info_path}")
+
     allocation = analyzer.allocate_bits(sensitivity, args.bits)
 
     if allocation:
@@ -62,8 +70,17 @@ def main():
             json.dump(allocation, f, indent=2)
 
         # Print stats
-        avg_bits = sum(allocation.values()) / len(allocation)
-        print(f"Final average bits: {avg_bits:.2f}")
+        total_params = sum(analyzer.layer_params.values())
+        total_bits = sum(allocation[name] * analyzer.layer_params[name] for name in allocation)
+        weighted_avg_bits = total_bits / total_params
+        
+        print(f"Final Weighted Average Bits: {weighted_avg_bits:.4f}")
+        
+        # Run visualization
+        print("Generating visualizations...")
+        viz_script = os.path.join(os.path.dirname(__file__), "visualize.py")
+        subprocess.run([sys.executable, viz_script, model_output_dir], check=True)
+        
     else:
         print("Allocation failed.")
 

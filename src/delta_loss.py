@@ -19,7 +19,9 @@ class DeltaLossAnalyzer:
         self.tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
         self.hooks = []
         self.layer_inputs = {}
+        self.layer_outputs = {}
         self.layer_grads = {}
+        self.layer_params = {} # Store parameter counts
         self.candidates = candidates if candidates else [2, 3, 4, 8]
 
     def get_calib_dataset(self, n_samples=16, seq_len=512):
@@ -114,6 +116,7 @@ class DeltaLossAnalyzer:
                 if isinstance(module, nn.Linear) and name in self.layer_inputs:
                     if name not in sensitivity_map:
                         sensitivity_map[name] = {b: 0.0 for b in self.candidates}
+                        self.layer_params[name] = module.weight.numel() # Record params
                     
                     grad_A = self.layer_grads[name]      # [Batch, Seq, Out]
                     input_val = self.layer_inputs[name]   # [Batch, Seq, In]
@@ -156,76 +159,50 @@ class DeltaLossAnalyzer:
         return sensitivity_map
 
     def allocate_bits(self, sensitivity_map, target_avg_bits):
-        print(f"Allocating bits for target avg: {target_avg_bits}...")
+        """
+        Performs bit allocation using Lagrange Multipliers to handle different layer sizes.
+        Objective: Minimize sum(S_l) subject to sum(P_l * b_l) / sum(P_l) <= target_avg_bits
+        """
+        print(f"Allocating bits (Weighted) for target avg: {target_avg_bits}...")
         
         layers = sorted(list(sensitivity_map.keys()))
-        n_layers = len(layers)
-        budget_limit = int(target_avg_bits * n_layers)
+        total_params = sum(self.layer_params.values())
+        target_total_bits = target_avg_bits * total_params
         
-        # DP Initialization
-        # dp[i][j] stores the min loss for the first i layers with total bit budget j
-        max_possible_budget = n_layers * max(self.candidates)
-        dp = np.full((n_layers + 1, max_possible_budget + 1), np.inf)
-        dp[0][0] = 0
+        # We search for a lambda such that choosing b_l to minimize (S_l + lambda * P_l * b_l)
+        # meets the budget constraint.
         
-        # choice[i][j] stores the bit-width chosen for layer i to achieve budget j
-        choice = np.zeros((n_layers + 1, max_possible_budget + 1), dtype=int)
+        low_lambda = 0.0
+        high_lambda = 1e10 # Start with a large range
+        best_allocation = None
         
-        layer_costs = [sensitivity_map[name] for name in layers]
-        min_bits, max_bits = min(self.candidates), max(self.candidates)
-
-        pbar = tqdm(range(1, n_layers + 1), desc="Searching")
-        for i in pbar:
-            layer_idx = i - 1
-            costs = layer_costs[layer_idx]
+        # Binary search for lambda
+        for _ in range(100):
+            mid_lambda = (low_lambda + high_lambda) / 2
+            current_allocation = {}
+            current_total_bits = 0
             
-            # Determine valid range of previous budgets to reduce search space
-            min_prev_budget = (i - 1) * min_bits
-            max_prev_budget = (i - 1) * max_bits
-
-            for b in self.candidates:
-                cost = costs[b]
+            for name in layers:
+                params = self.layer_params[name]
+                costs = sensitivity_map[name]
                 
-                # Check valid previous states
-                for prev_j in range(min_prev_budget, max_prev_budget + 1):
-                    if dp[i - 1][prev_j] == np.inf:
-                        continue
-                    
-                    new_j = prev_j + b
-                    new_loss = dp[i - 1][prev_j] + cost
-                    
-                    if new_loss < dp[i][new_j]:
-                        dp[i][new_j] = new_loss
-                        choice[i][new_j] = b
-            
-            # Logging
-            valid_losses = dp[i][dp[i] != np.inf]
-            if len(valid_losses) > 0:
-                pbar.set_postfix({"min_delta": f"{np.min(valid_losses):.2e}"})
-
-        # Find best configuration within budget limit
-        # We search in range [min_possible_budget, target_budget_limit]
-        best_loss = np.inf
-        best_j = -1
-        
-        search_start = n_layers * min_bits
-        search_end = min(budget_limit, max_possible_budget)
-
-        for j in range(search_start, search_end + 1):
-            if dp[n_layers][j] < best_loss:
-                best_loss = dp[n_layers][j]
-                best_j = j
+                # Pick bits that minimize: Sensitivity + lambda * Total_Bits_In_Layer
+                # b = argmin ( costs[b] + mid_lambda * params * b )
+                best_b = min(self.candidates, key=lambda b: costs[b] + mid_lambda * params * b)
                 
-        if best_j == -1:
-            print("Could not find a valid configuration within budget!")
-            return None
+                current_allocation[name] = best_b
+                current_total_bits += params * best_b
             
-        # Reconstruct Allocation
-        allocation = {}
-        curr_j = best_j
-        for i in range(n_layers, 0, -1):
-            b = int(choice[i][curr_j])
-            allocation[layers[i - 1]] = b
-            curr_j -= b
+            if current_total_bits <= target_total_bits:
+                best_allocation = current_allocation
+                high_lambda = mid_lambda # Try to lower lambda to get closer to budget
+                if abs(current_total_bits - target_total_bits) / target_total_bits < 0.001:
+                    break
+            else:
+                low_lambda = mid_lambda # Need more penalty for bits, increase lambda
+
+        if best_allocation:
+            actual_avg = sum(best_allocation[n] * self.layer_params[n] for n in layers) / total_params
+            print(f"Allocation found. Actual Weighted Avg Bits: {actual_avg:.4f}")
             
-        return allocation
+        return best_allocation
