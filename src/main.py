@@ -34,7 +34,8 @@ def main():
 
     # Create a safe model name for file paths
     safe_model_name = args.model.replace("/", "_")
-    model_output_dir = os.path.join(args.output_dir, safe_model_name)
+    output_subdir = f"{safe_model_name}_bits{args.bits}"
+    model_output_dir = os.path.join(args.output_dir, output_subdir)
 
     # Ensure output directory exists
     os.makedirs(model_output_dir, exist_ok=True)
