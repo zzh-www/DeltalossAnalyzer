@@ -165,8 +165,8 @@ def plot_allocation_profile(allocation, model_info, output_dir):
                 hatch=hatch
             )
             
-            # Add text label if segment is large enough (> 4% of block height)
-            if seg["params"] / block_total_params > 0.04:
+            # Add text label if segment is large enough (> 2% of block height)
+            if seg["params"] / block_total_params > 0.02:
                 # Map module to short abbreviation
                 short_map = {
                     "Q_proj": "Q", "K_proj": "K", "V_proj": "V", "O_proj": "O",
