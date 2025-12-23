@@ -47,9 +47,10 @@ class DeltaLossAnalyzer:
 
         def forward_hook(module, input, output, name):
             self.layer_inputs[name] = input[0].detach()
+            self.layer_outputs[name] = output.detach() # A_fp
 
         def backward_hook(module, grad_input, grad_output, name):
-            self.layer_grads[name] = grad_output[0].detach()
+            self.layer_grads[name] = grad_output[0].detach() # dL/dA
 
         for name, module in self.model.named_modules():
             if isinstance(module, nn.Linear) and "lm_head" not in name:
@@ -69,6 +70,7 @@ class DeltaLossAnalyzer:
             h.remove()
         self.hooks = []
         self.layer_inputs = {}
+        self.layer_outputs = {}
         self.layer_grads = {}
 
     def fake_quantize(self, weight, bits):
@@ -95,6 +97,7 @@ class DeltaLossAnalyzer:
         self.model.eval()
         
         sensitivity_map = {}
+        total_tokens = 0
 
         pbar = tqdm(samples, desc="Calibration")
         for i, sample in enumerate(pbar):
@@ -112,28 +115,43 @@ class DeltaLossAnalyzer:
                     if name not in sensitivity_map:
                         sensitivity_map[name] = {b: 0.0 for b in self.candidates}
                     
-                    X = self.layer_inputs[name] # [Batch, Seq, In]
-                    G = self.layer_grads[name]  # [Batch, Seq, Out]
-                    W = module.weight           # [Out, In]
+                    grad_A = self.layer_grads[name]      # [Batch, Seq, Out]
+                    input_val = self.layer_inputs[name]   # [Batch, Seq, In]
+                    A_fp = self.layer_outputs[name]      # [Batch, Seq, Out]
+                    W = module.weight
+                    bias = module.bias
 
-                    X_flat = X.reshape(-1, X.shape[-1])
-                    G_flat = G.reshape(-1, G.shape[-1])
+                    grad_A_flat = grad_A.reshape(-1, grad_A.shape[-1])
+                    input_val_flat = input_val.reshape(-1, input_val.shape[-1])
+                    A_fp_flat = A_fp.reshape(-1, A_fp.shape[-1])
+
+                    # Current Batch Token Count
+                    n_tokens = grad_A_flat.shape[0]
+                    if name == list(sensitivity_map.keys())[0]: # Only count tokens once per sample
+                        total_tokens += n_tokens
 
                     for bits in self.candidates:
-                        W_hat = self.fake_quantize(W, bits)
-                        dW = (W - W_hat).t() 
+                        W_q = self.fake_quantize(W, bits)
+                        A_q_flat = torch.matmul(input_val_flat, W_q.t())
+                        if bias is not None:
+                            A_q_flat += bias
                         
-                        # DeltaY = X @ dW
-                        DeltaY = torch.matmul(X_flat, dW)
-                        
-                        # DeltaLoss = sum( | G * DeltaY | )
-                        delta_loss = (G_flat * DeltaY).abs().sum().item()
-                        sensitivity_map[name][bits] += delta_loss
+                        # DeltaLoss for this sample: sum of |grad * error|
+                        sample_score = (grad_A_flat * (A_fp_flat - A_q_flat)).abs().sum().item()
+                        sensitivity_map[name][bits] += sample_score
             
             # Clear buffers
             self.layer_inputs = {}
+            self.layer_outputs = {}
             self.layer_grads = {}
             
+        # 6. Global average over all tokens in the calibration set
+        # This gives the "Expected Loss Increase per Token"
+        if total_tokens > 0:
+            for name in sensitivity_map:
+                for bits in self.candidates:
+                    sensitivity_map[name][bits] /= total_tokens
+
         self.remove_hooks()
         return sensitivity_map
 
