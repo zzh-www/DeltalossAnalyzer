@@ -1,10 +1,10 @@
 import torch
+import functools
 import torch.nn as nn
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from datasets import load_dataset
 import numpy as np
 from tqdm import tqdm
-import functools
 
 class DeltaLossAnalyzer:
     def __init__(self, model_id, device="cuda", candidates=None):
@@ -24,7 +24,7 @@ class DeltaLossAnalyzer:
         self.layer_params = {} # Store parameter counts
         self.candidates = candidates if candidates else [2, 3, 4, 8]
 
-    def get_calib_dataset(self, n_samples=16, seq_len=512):
+    def get_calib_dataset(self, n_samples=16, seq_len=1024):
         print("Loading calibration dataset...")
         try:
             data = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
@@ -116,7 +116,7 @@ class DeltaLossAnalyzer:
                 if isinstance(module, nn.Linear) and name in self.layer_inputs:
                     if name not in sensitivity_map:
                         sensitivity_map[name] = {b: 0.0 for b in self.candidates}
-                        self.layer_params[name] = module.weight.numel() # Record params
+                        self.layer_params[name] = module.weight.shape[0] *  module.weight.shape[1] # Record params
                     
                     grad_A = self.layer_grads[name]      # [Batch, Seq, Out]
                     input_val = self.layer_inputs[name]   # [Batch, Seq, In]
@@ -166,6 +166,10 @@ class DeltaLossAnalyzer:
         print(f"Allocating bits (Weighted) for target avg: {target_avg_bits}...")
         
         layers = sorted(list(sensitivity_map.keys()))
+        diff_params = list(set(self.layer_params.values()))
+        scale = functools.reduce(torch.gcd, torch.tensor(diff_params, dtype=torch.long)).item()
+        for name in layers:
+            self.layer_params[name] /= scale
         total_params = sum(self.layer_params.values())
         target_total_bits = target_avg_bits * total_params
         
@@ -173,11 +177,11 @@ class DeltaLossAnalyzer:
         # meets the budget constraint.
         
         low_lambda = 0.0
-        high_lambda = 1e10 # Start with a large range
+        high_lambda = max(list(set(self.layer_params.values()))) # Start with a large range
         best_allocation = None
         
         # Binary search for lambda
-        for _ in range(100):
+        for step in range(128):
             mid_lambda = (low_lambda + high_lambda) / 2
             current_allocation = {}
             current_total_bits = 0
@@ -195,14 +199,18 @@ class DeltaLossAnalyzer:
             
             if current_total_bits <= target_total_bits:
                 best_allocation = current_allocation
+                actual_avg = sum(best_allocation[n] * self.layer_params[n] for n in layers) / total_params
+                actual_loss = sum(sensitivity_map[n][best_allocation[n]] for n in layers)
+                print(f"step {step}: avg_bit {actual_avg}, loss: {actual_loss:.5f}")
                 high_lambda = mid_lambda # Try to lower lambda to get closer to budget
-                if abs(current_total_bits - target_total_bits) / target_total_bits < 0.001:
+                if abs(current_total_bits - target_total_bits) / target_total_bits < 0.0001:
                     break
             else:
                 low_lambda = mid_lambda # Need more penalty for bits, increase lambda
 
         if best_allocation:
             actual_avg = sum(best_allocation[n] * self.layer_params[n] for n in layers) / total_params
-            print(f"Allocation found. Actual Weighted Avg Bits: {actual_avg:.4f}")
+            actual_loss = sum(sensitivity_map[n][best_allocation[n]] for n in layers)
+            print(f"Allocation found. Actual Weighted Avg Bits: {actual_avg:.4f}, loss: {actual_loss:.5f}")
             
         return best_allocation
